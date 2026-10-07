@@ -10,6 +10,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / 'data'
 OUT_DIR = BASE_DIR / 'out'
 
+# Sufifo nos nomes dos arquivos ao salvar, ano nesse caso
+# SUFIXO = '2024'
+# SUFIXO = '2024_01_01-30'
+SUFIXO = '2024_03_01-31'
+
 
 # ==============================================================================
 # FUNÇÕES DE CÁLCULO DE ÍNDICES ESPECTRAIS
@@ -111,7 +116,7 @@ def exportar_faixas_individuais(caminho_entrada: Path, pasta_saida: Path) -> Non
 
         for idx in range(1, src.count + 1):
             nome_banda = src.descriptions[idx - 1] if (src.descriptions and src.descriptions[idx - 1]) else f"B{idx}"
-            caminho_banda = pasta_saida / f"{nome_banda}_PortoFerreira.tif"
+            caminho_banda = pasta_saida / f"{nome_banda}_PortoFerreira_{SUFIXO}.tif"
 
             meta_banda = meta_base.copy()
             meta_banda.update(
@@ -222,16 +227,16 @@ def processar_analises_ambientais(caminho_multiespectral: Path, pasta_saida: Pat
     # 4. Salvar cada índice como arquivo GeoTIFF independente
     print(f"\n--- Salvando GeoTIFFs Temáticos ---")
     for nome_indice, matriz in indices.items():
-        caminho_saida = pasta_saida / f"{nome_indice}_PortoFerreira.tif"
+        caminho_saida = pasta_saida / f"{nome_indice}_PortoFerreira_{SUFIXO}.tif"
         salvar_raster_indice(matriz, caminho_saida, meta, nome_indice)
 
     # 5. Gerar Painel de Visualização
-    painel_path = pasta_saida / 'painel_analises_ambientais_PortoFerreira.png'
+    painel_path = pasta_saida / f"painel_analises_ambientais_PortoFerreira_{SUFIXO}.png"
     gerar_painel_visualizacao(indices, painel_path, exibir_janela=exibir_graficos)
 
     print("\n[OK] Processamento concluido com sucesso!")
 
 
 if __name__ == '__main__':
-    caminho_imagem = DATA_DIR / 'S2_Multiespectral_PortoFerreira-v2.tif'
+    caminho_imagem = DATA_DIR / f"S2_Multiespectral_PortoFerreira_{SUFIXO}.tif"
     processar_analises_ambientais(caminho_imagem, OUT_DIR, exibir_graficos=False)
