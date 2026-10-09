@@ -1,4 +1,29 @@
 // ==============================================================================
+// Coleta do Sentinel-2 no Google Earth Engine - Porto Ferreira/SP
+//
+// Alternativa ao app web (pasta backend/), para quem prefere o Code Editor do GEE.
+// Ajustes em relação à versão anterior:
+//   * nuvem removida pixel a pixel (Cloud Score+) em vez de descartar a cena inteira
+//     pelo CLOUDY_PIXEL_PERCENTAGE do tile (110 x 110 km) - a ROI fica na divisa de 4 tiles;
+//   * coleção vazia não quebra mais a exportação (imagem mascarada de reserva);
+//   * buracos preenchidos com uma janela de 90 dias centrada no período;
+//   * banda N_OBS com o número de observações válidas por pixel;
+//   * tabela com as cenas usadas e nomes de arquivo com o período (rastreabilidade);
+//   * exportação em SIRGAS 2000 / UTM 23S (EPSG:31983), mesmo CRS do projeto QGIS.
+// ==============================================================================
+
+// ------------------------------------------------------------------ parâmetros
+var DATA_INICIO = '2024-02-01';
+var DATA_FIM = '2024-03-01'; // exclusivo (filterDate)
+var NUVEM_MAX_CENA = 80; // % do tile; filtro frouxo, só descarta cenas quase totalmente nubladas
+var LIMIAR_CS = 0.6; // Cloud Score+ (cs_cdf): >= 0.6 é considerado limpo
+var DIAS_RESERVA = 45; // meia-janela usada para tapar buracos (total 90 dias)
+var PASTA_DRIVE = 'EarthEngine_Exports';
+var CRS_SAIDA = 'EPSG:31983';
+
+var BANDAS = ['B2', 'B3', 'B4', 'B5', 'B8', 'B11', 'B12'];
+
+// ==============================================================================
 // 1. ÁREA DE INTERESSE (ROI) - PORTO FERREIRA
 // ==============================================================================
 var roi = ee.Geometry.Polygon([
@@ -12,19 +37,43 @@ var roi = ee.Geometry.Polygon([
 ]);
 
 // ==============================================================================
-// 2. FUNÇÕES MODULARES DE PROCESSAMENTO E CÁLCULO DE ÍNDICES
+// 2. FUNÇÕES DE COLETA E COMPOSIÇÃO
 // ==============================================================================
+var CS_PLUS = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
 
 /**
- * Filtra a coleção Sentinel-2 Surface Reflectance e gera a imagem mediana recortada na ROI.
+ * Sentinel-2 SR harmonizado, com nuvem/sombra mascaradas pixel a pixel pelo Cloud Score+.
  */
-function obterMosaicoSentinel2(geometria, dataInicio, dataFim, maxNuvens) {
-  var colecao = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+function colecaoMascarada(geometria, inicio, fim) {
+  return ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
     .filterBounds(geometria)
-    .filterDate(dataInicio, dataFim)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', maxNuvens));
+    .filterDate(inicio, fim)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', NUVEM_MAX_CENA))
+    .linkCollection(CS_PLUS, ['cs_cdf'])
+    .map(function (img) {
+      return img.updateMask(img.select('cs_cdf').gte(LIMIAR_CS)).select(BANDAS);
+    });
+}
 
-  return colecao.median().clip(geometria);
+/**
+ * Mediana sem nuvem do período + preenchimento com janela de reserva + banda N_OBS.
+ */
+function obterMosaicoSentinel2(geometria, inicio, fim) {
+  // imagem 100% mascarada: garante que as bandas existam mesmo se a coleção vier vazia
+  var vazia = ee.Image.constant([0, 0, 0, 0, 0, 0, 0]).rename(BANDAS).toUint16().updateMask(0);
+  var colecao = colecaoMascarada(geometria, inicio, fim);
+  var comVazia = colecao.merge(ee.ImageCollection([vazia]));
+
+  var dias = ee.Date(fim).difference(ee.Date(inicio), 'day');
+  var meio = ee.Date(inicio).advance(dias.divide(2), 'day');
+  var reserva = colecaoMascarada(geometria, meio.advance(-DIAS_RESERVA, 'day'), meio.advance(DIAS_RESERVA, 'day'))
+    .merge(ee.ImageCollection([vazia]))
+    .median();
+
+  var nObs = comVazia.select('B4').count().rename('N_OBS');
+  var mosaico = comVazia.median().unmask(reserva).addBands(nObs.unmask(0));
+
+  return { imagem: mosaico.clip(geometria), colecao: colecao };
 }
 
 /**
@@ -73,6 +122,12 @@ function adicionarCamadasVisualizacao(imagemProcessada, geometria) {
     max: 4000
   }, 'Falsa-Cor Vegetação (B8/B4/B3)', false);
 
+  // Observações válidas por pixel: onde é 0, o pixel veio da janela de reserva
+  Map.addLayer(imagemProcessada.select('N_OBS'), {
+    min: 0, max: 10,
+    palette: ['red', 'yellow', 'green']
+  }, 'N_OBS (observações válidas)', false);
+
   // Índices de Vegetação
   Map.addLayer(imagemProcessada.select('NDVI'), {
     min: -0.1, max: 0.9,
@@ -108,31 +163,56 @@ function adicionarCamadasVisualizacao(imagemProcessada, geometria) {
 }
 
 /**
- * Configura e dispara a tarefa de exportação do stack multiespectral para o Google Drive.
+ * Exporta o stack multiespectral (7 bandas + N_OBS) para o Google Drive.
  */
 function exportarStackMultiespectral(imagem, geometria, nomeArquivo, pastaDrive) {
-  var bandasUteis = ['B2', 'B3', 'B4', 'B5', 'B8', 'B11', 'B12'];
-  var exportImage = imagem.select(bandasUteis).toUint16();
+  var exportImage = imagem.select(BANDAS.concat(['N_OBS'])).toUint16();
 
   Export.image.toDrive({
     image: exportImage,
     description: nomeArquivo,
     folder: pastaDrive,
     scale: 10, // Reamostragem das bandas de 20m para 10m
+    crs: CRS_SAIDA,
     region: geometria,
     fileFormat: 'GeoTIFF',
     maxPixels: 1e13
   });
 }
 
+/**
+ * Exporta a lista de cenas usadas (data, tile, nuvem do tile) para documentar a composição.
+ */
+function exportarListaCenas(colecao, nomeArquivo, pastaDrive) {
+  var cenas = ee.FeatureCollection(colecao.map(function (img) {
+    return ee.Feature(null, {
+      cena: img.get('system:index'),
+      data: img.date().format('YYYY-MM-dd'),
+      tile: img.get('MGRS_TILE'),
+      nuvem_tile_pct: img.get('CLOUDY_PIXEL_PERCENTAGE')
+    });
+  }));
+  print('Cenas usadas', cenas.size(), cenas.aggregate_array('data'));
+  Export.table.toDrive({
+    collection: cenas,
+    description: nomeArquivo,
+    folder: pastaDrive,
+    fileFormat: 'CSV'
+  });
+}
+
 // ==============================================================================
 // 3. EXECUÇÃO DO FLUXO NO GOOGLE EARTH ENGINE
 // ==============================================================================
-var mosaico = obterMosaicoSentinel2(roi, '2026-01-01', '2026-08-28', 10);
-var imagemAnalises = calcularIndicesAmbientais(mosaico);
+// Sufixo no mesmo padrão do pipeline Python (ex.: 2024-02-01_2024-02-29)
+var sufixo = DATA_INICIO + '_' + ee.Date(DATA_FIM).advance(-1, 'day').format('YYYY-MM-dd').getInfo();
+
+var resultado = obterMosaicoSentinel2(roi, DATA_INICIO, DATA_FIM);
+var imagemAnalises = calcularIndicesAmbientais(resultado.imagem);
 
 // Adicionar visualizações interativas ao mapa
 adicionarCamadasVisualizacao(imagemAnalises, roi);
 
-// Exportar imagem de 7 bandas para o Google Drive
-exportarStackMultiespectral(mosaico, roi, 'S2_Multiespectral_PortoFerreira', 'EarthEngine_Exports');
+// Exportar imagem de 7 bandas + N_OBS e a lista de cenas para o Google Drive
+exportarStackMultiespectral(resultado.imagem, roi, 'S2_Multiespectral_PortoFerreira_' + sufixo, PASTA_DRIVE);
+exportarListaCenas(resultado.colecao, 'S2_Cenas_PortoFerreira_' + sufixo, PASTA_DRIVE);

@@ -1,3 +1,12 @@
+"""Processa um GeoTIFF multiespectral exportado pelo Earth Engine (earhengine/obter-imagens.js).
+
+Uso:
+    python src/processar-multispectral-pf.py --sufixo 2024-02-01_2024-02-29
+    python src/processar-multispectral-pf.py --entrada data/minha_imagem.tif --sufixo teste
+
+Para baixar e processar sem passar pelo Earth Engine, use o app web (docker compose up).
+"""
+import argparse
 from pathlib import Path
 import rasterio
 import numpy as np
@@ -10,10 +19,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / 'data'
 OUT_DIR = BASE_DIR / 'out'
 
-# Sufifo nos nomes dos arquivos ao salvar, ano nesse caso
-# SUFIXO = '2024'
-# SUFIXO = '2024_01_01-30'
-SUFIXO = '2024_03_01-31'
+# Valor gravado pelo Earth Engine nos pixels sem observação válida (toUint16 de pixel mascarado)
+NODATA_ENTRADA = 0
+# Bandas auxiliares que não são reflectância (não entram no cálculo dos índices)
+BANDAS_AUXILIARES = {'N_OBS'}
 
 
 # ==============================================================================
@@ -84,6 +93,7 @@ def carregar_dados_e_metadados(caminho_arquivo: Path) -> tuple[dict[str, np.ndar
     """
     Abre o GeoTIFF multiespectral, carrega as bandas aplicando o fator de escala (0.0001)
     e retorna o dicionário de bandas, metadados espaciais e descrições originais.
+    Pixels com valor 0 (sem observação válida) viram NaN, para não gerarem índices falsos.
     """
     if not caminho_arquivo.exists():
         raise FileNotFoundError(f"Arquivo não encontrado: {caminho_arquivo}")
@@ -98,13 +108,19 @@ def carregar_dados_e_metadados(caminho_arquivo: Path) -> tuple[dict[str, np.ndar
 
         for idx in range(1, src.count + 1):
             nome_banda = descricoes[idx - 1] if (len(descricoes) >= idx and descricoes[idx - 1]) else nomes_padrao[idx - 1]
+            dados = src.read(idx)
+            if nome_banda in BANDAS_AUXILIARES:
+                bandas[nome_banda] = dados
+                continue
             # Converte para float32 e aplica escala de refletância de superfície (0 a 1)
-            bandas[nome_banda] = src.read(idx).astype('float32') / 10000.0
+            reflectancia = dados.astype('float32') / 10000.0
+            reflectancia[dados == NODATA_ENTRADA] = np.nan
+            bandas[nome_banda] = reflectancia
 
     return bandas, meta, descricoes
 
 
-def exportar_faixas_individuais(caminho_entrada: Path, pasta_saida: Path) -> None:
+def exportar_faixas_individuais(caminho_entrada: Path, pasta_saida: Path, sufixo: str) -> None:
     """
     Exporta cada faixa espectral bruta como arquivo GeoTIFF individual de 1 banda.
     """
@@ -116,12 +132,13 @@ def exportar_faixas_individuais(caminho_entrada: Path, pasta_saida: Path) -> Non
 
         for idx in range(1, src.count + 1):
             nome_banda = src.descriptions[idx - 1] if (src.descriptions and src.descriptions[idx - 1]) else f"B{idx}"
-            caminho_banda = pasta_saida / f"{nome_banda}_PortoFerreira_{SUFIXO}.tif"
+            caminho_banda = pasta_saida / f"{nome_banda}_PortoFerreira_{sufixo}.tif"
 
             meta_banda = meta_base.copy()
             meta_banda.update(
                 count=1,
-                dtype=src.dtypes[idx - 1]
+                dtype=src.dtypes[idx - 1],
+                nodata=None if nome_banda in BANDAS_AUXILIARES else NODATA_ENTRADA,
             )
 
             dados_brutos = src.read(idx)
@@ -189,14 +206,15 @@ def gerar_painel_visualizacao(indices: dict[str, np.ndarray], caminho_saida: Pat
 # ==============================================================================
 # FLUXO PRINCIPAL DE EXECUÇÃO
 # ==============================================================================
-def processar_analises_ambientais(caminho_multiespectral: Path, pasta_saida: Path, exibir_graficos: bool = False) -> None:
+def processar_analises_ambientais(caminho_multiespectral: Path, pasta_saida: Path, sufixo: str,
+                                  exibir_graficos: bool = False) -> None:
     """
     Pipeline completo: exportação de faixas, cálculo de índices e geração de produtos cartográficos.
     """
     pasta_saida.mkdir(parents=True, exist_ok=True)
 
     # 1. Exportar bandas espectrais individuais
-    exportar_faixas_individuais(caminho_multiespectral, pasta_saida)
+    exportar_faixas_individuais(caminho_multiespectral, pasta_saida, sufixo)
 
     # 2. Carregar matrizes de refletância
     print(f"\n--- Carregando Matrizes de Refletância ---")
@@ -227,16 +245,29 @@ def processar_analises_ambientais(caminho_multiespectral: Path, pasta_saida: Pat
     # 4. Salvar cada índice como arquivo GeoTIFF independente
     print(f"\n--- Salvando GeoTIFFs Temáticos ---")
     for nome_indice, matriz in indices.items():
-        caminho_saida = pasta_saida / f"{nome_indice}_PortoFerreira_{SUFIXO}.tif"
+        caminho_saida = pasta_saida / f"{nome_indice}_PortoFerreira_{sufixo}.tif"
         salvar_raster_indice(matriz, caminho_saida, meta, nome_indice)
 
     # 5. Gerar Painel de Visualização
-    painel_path = pasta_saida / f"painel_analises_ambientais_PortoFerreira_{SUFIXO}.png"
+    painel_path = pasta_saida / f"painel_analises_ambientais_PortoFerreira_{sufixo}.png"
     gerar_painel_visualizacao(indices, painel_path, exibir_janela=exibir_graficos)
 
     print("\n[OK] Processamento concluido com sucesso!")
 
 
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--sufixo', required=True,
+                        help='Período no nome dos arquivos (o mesmo usado na exportação do GEE)')
+    parser.add_argument('--entrada', type=Path,
+                        help='GeoTIFF de entrada (padrão: data/S2_Multiespectral_PortoFerreira_<sufixo>.tif)')
+    parser.add_argument('--saida', type=Path, default=OUT_DIR, help='Pasta de saída (padrão: out/)')
+    parser.add_argument('--exibir', action='store_true', help='Abre o painel em uma janela ao final')
+    args = parser.parse_args()
+
+    entrada = args.entrada or DATA_DIR / f"S2_Multiespectral_PortoFerreira_{args.sufixo}.tif"
+    processar_analises_ambientais(entrada, args.saida, args.sufixo, exibir_graficos=args.exibir)
+
+
 if __name__ == '__main__':
-    caminho_imagem = DATA_DIR / f"S2_Multiespectral_PortoFerreira_{SUFIXO}.tif"
-    processar_analises_ambientais(caminho_imagem, OUT_DIR, exibir_graficos=False)
+    main()

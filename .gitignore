@@ -1,2 +1,22 @@
+# Dados geoespaciais pesados (gerados ou baixados)
 data/
 out/
+*.tif
+*.tif.aux.xml
+*.aux.xml
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+backend/storage/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Ambiente
+.env
